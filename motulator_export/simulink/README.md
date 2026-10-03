@@ -32,6 +32,7 @@ A compiled S-function stays loaded in MATLAB after its model is closed, so run `
 | `_drive.py`, `sm.py`, `im.py`, `grid.py` | Writers of the drives and the grid converter systems: `write_model` writes the S-function and the build script; `simulate` builds and runs the model                 |
 | `build_drive.m`                          | Builder of the drive models: the layout of the system and the machine subsystems                                                                                     |
 | `build_grid.m`                           | Builder of the grid converter models: the layout of the system, the AC filter, and the grid                                                                          |
+| `build_control.m`, `run_control.m`       | Builder of the library of a control system, and its simulation with given inputs                                                                                     |
 | `+blocks/`                               | MATLAB package of the common parts: the model settings, the compilation, the control-system subsystem, the PWM, the converter, the mechanics, and the layout helpers |
 
 ## S-function
@@ -41,6 +42,29 @@ It has the ports, the parameters, the sample time, and the continuous states of 
 As in *motulator*, the outputs are computed from the measurements of the same sampling instant and the states are updated in `mdlUpdate`.
 The state of the C code is in static variables, as in the C-Script block, so a model can contain one instance of the block.
 
+The first input of every control system is `enable` (see `enable_code` in `../plecs/_common.py`), which is 1 in the exported models by default (`enable` of `write_model`).
+While it is not positive, the control algorithm is not run: the duty ratios are 0.5, the monitored signals are zero, and the state is reset to its initial value (a copy saved at the end of the start function).
+The control system thus starts from its initial state when enabled, e.g., after a fault.
+The control systems limit the measured DC-bus voltage to at least 1 V (`U_DC_MIN`), which avoids the division by zero in the PWM if the DC bus is not charged.
+The simulated control system is thus the same as the one run in a real-time target.
+
+## Control system for real-time targets
+
+The control system of an induction machine drive can be exported alone as a library, to be used with the I/O blocks of a real-time target (e.g., dSPACE) instead of the system model:
+
+```bash
+python examples/im_2kw_cvc_control.py
+```
+
+This writes `examples/simulink/build_im_2kw_cvc_control.m` (`im.write_control_system`), which builds the library `im_2kw_cvc_control.slx` containing the masked subsystem of the control system, with the inputs `enable`, `w_M_ref`, `i_s_abc`, `u_dc`, and `w_M` and the outputs `d_abc` and `signals`.
+The code of the S-function is that of the model `im_2kw_cvc.slx`, but its source (`sfun_im_2kw_cvc_control.c`, named after the library) is standalone, i.e., it contains the C port, so the folder has all the files needed for building the real-time application.
+The library is saved in the format of the MATLAB release that runs the script, so run the script in the release of the target.
+
+The computational delay of one sampling period and the PWM are not in the library; they are those of the target.
+
+The script runs the library in Simulink with given inputs (open loop), the control system being disabled in the beginning and in the middle, and compares the two enabled periods of 400 samples with *motulator* started from its initial state (MATLAB R2026a, *motulator* 0.8.1): the duty ratios differ by 4.9e-12 and the estimated speed by 6.5e-10 rad/s at most.
+The build of a real-time application has not been tested.
+
 ## Model structure
 
 - **Control system**: a masked subsystem with the S-function, with the mask parameters on tabs as in the PLECS model. A GradNet flux map is a struct in the model workspace (`est_flux_map`), whose fields the mask initialization passes to the S-function. The first output of the S-function is the duty ratios, and the others are the groups of the monitored signals, which are combined into the output `signals`.
@@ -48,7 +72,7 @@ The state of the C code is in static variables, as in the C-Script block, so a m
 - **PWM**: a triangular carrier (Repeating Sequence, period `2*T_s`, starting from its maximum) compared with the duty ratios by a Relational Operator block. Simulink locates the switching instants by zero-crossing detection. This corresponds to `CarrierComparison` of *motulator* without the counter quantization.
 - **Converter**: the ideal two-level converter with a stiff DC bus, `u_s_ab = u_dc*q_ab` (`VoltageSourceConverter`). The dead time of the converter is not modeled, but the control system of an induction machine drive can compensate for it (`PWM(d_err=...)` with `dead_time_error`), as in the PLECS export; this is intended for the control system running on the hardware. The other DC buses of the PLECS export (a capacitor or a diode bridge, `ipmsm_2kw_fvc.py --diode`) are not supported, since their switching circuits would need Simscape Electrical or the zero-crossing detection of the diode states.
 - **AC filter and grid** (grid converters): the LCL filter, or the L filter with the grid inductance, modeled with space vectors in stationary coordinates in a MATLAB Function block, with the states in an Integrator block, as in `LCLFilter` and `LFilter` of *motulator*. The grid voltage `e_g*exp(1j*w_g*t)` is generated by Sine Wave blocks. Without the grid impedance, the PCC voltage measured by grid-following control is the grid voltage.
-- **References**: Step blocks, or a sum of Step blocks for several steps, and Constant blocks.
+- **References and the input `enable`**: Step blocks, or a sum of Step blocks for several steps, and Constant blocks.
 - **Machine**: the flux linkages as the state (an Integrator block), and a MATLAB Function block with the currents, the voltage equations, and the torque. The synchronous machine is modeled in rotor coordinates, as `SynchronousMachine` of *motulator*. The induction machine is modeled with the inverse-Γ model in stator coordinates, which is equivalent to the Γ model of `InductionMachine` of *motulator*.
 - **Mechanics**: integrators for the speed and the angle (`MechanicalSystem` without friction).
 - **Solver**: `ode45` (Dormand–Prince) with the relative tolerance of 1e-6 and the maximum step `T_s`, as in PLECS. The parameters of the system model are in the model workspace (`machine`, `mechanics`, and `converter`).

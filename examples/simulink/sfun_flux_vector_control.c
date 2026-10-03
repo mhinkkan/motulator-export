@@ -39,6 +39,10 @@
 /* Parameter value, or NAN for an empty parameter (None in motulator) */
 #define PARAM(i) (PDIM(i) > 0 ? P(i, 0) : NAN)
 
+/* Lower limit (V) of the measured DC-bus voltage, which avoids the division by
+ * zero in the PWM if the DC bus is not charged */
+#define U_DC_MIN 1.0
+
 /* Check that a GradNet in the parameters i0, i0 + 1, ... (GRADNET_FIELDS) fits
  * in the arrays of the C port (in the start function only, returns on error) */
 #define CHECK_GRADNET(i0) \
@@ -77,11 +81,14 @@
 
 static VectorControlSystem ctrl;
 
+/* Initial state, restored while the control system is disabled */
+static VectorControlSystem ctrl_init;
+
 /* Ports and parameters of the C-Script */
-static const int INPUT_WIDTHS[] = {1, 3, 1, 1};
-static const int FEEDTHROUGH[] = {1, 1, 1, 1};
+static const int INPUT_WIDTHS[] = {1, 1, 3, 1, 1};
+static const int FEEDTHROUGH[] = {1, 1, 1, 1, 1};
 static const int OUTPUT_WIDTHS[] = {3, 2, 2, 2, 3};
-#define NUM_INPUTS 4
+#define NUM_INPUTS 5
 #define NUM_OUTPUTS 5
 #define NUM_PARAMS 34
 
@@ -232,17 +239,36 @@ static void mdlStart(SimStruct *S)
         PDIM(22) > 0 ? P(22, 0) : INFINITY);
 
     vector_control_system_init(&ctrl, par, &cfg, speed_ctrl);
+
+    ctrl_init = ctrl;
 }
 
 static void mdlOutputs(SimStruct *S, int_T tid)
 {
     UNUSED_ARG(tid);
+    /* Disabled: zero voltage, the control algorithm is not run */
+    if (!(InputSignal(0, 0) > 0.0)) {
+        for (int k = 0; k < 3; k++) {
+            OutputSignal(0, k) = 0.5;
+        }
+        OutputSignal(1, 0) = 0.0;
+        OutputSignal(1, 1) = 0.0;
+        OutputSignal(2, 0) = 0.0;
+        OutputSignal(2, 1) = 0.0;
+        OutputSignal(3, 0) = 0.0;
+        OutputSignal(3, 1) = 0.0;
+        OutputSignal(4, 0) = 0.0;
+        OutputSignal(4, 1) = 0.0;
+        OutputSignal(4, 2) = 0.0;
+        return;
+    }
+
     /* Measurements */
-    double w_M_ref = InputSignal(0, 0);
-    double i_s_abc[3] = {InputSignal(1, 0), InputSignal(1, 1),
-                         InputSignal(1, 2)};
-    Measurements meas = {abc2complex(i_s_abc), InputSignal(2, 0),
-                         InputSignal(3, 0)};
+    double w_M_ref = InputSignal(1, 0);
+    double i_s_abc[3] = {InputSignal(2, 0), InputSignal(2, 1),
+                         InputSignal(2, 2)};
+    double u_dc = fmax(InputSignal(3, 0), U_DC_MIN);
+    Measurements meas = {abc2complex(i_s_abc), u_dc, InputSignal(4, 0)};
 
     vector_control_system_compute_output(&ctrl, &meas, w_M_ref);
 
@@ -267,6 +293,12 @@ static void mdlOutputs(SimStruct *S, int_T tid)
 static void mdlUpdate(SimStruct *S, int_T tid)
 {
     UNUSED_ARG(tid);
+    /* Disabled: reset the state */
+    if (!(InputSignal(0, 0) > 0.0)) {
+        ctrl = ctrl_init;
+        return;
+    }
+
     vector_control_system_update(&ctrl);
 }
 

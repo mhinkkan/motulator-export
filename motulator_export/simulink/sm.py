@@ -65,6 +65,7 @@ def write_model(
     tau_L: StepSignal,
     t_stop: float,
     speed_ctrl_args: dict[str, float],
+    enable: StepSignal | float = 1.0,
 ) -> Path:
     """
     Write a MATLAB script that builds the Simulink model of the drive system.
@@ -89,6 +90,10 @@ def write_model(
         Simulation stop time (s).
     speed_ctrl_args : dict[str, float]
         Arguments of `SpeedController` used in `ctrl`.
+    enable : StepSignal | float, optional
+        Input `enable` of the control system, defaults to 1 (enabled). While it is
+        not positive, the duty ratios are 0.5 and the state of the control system is
+        reset to its initial value.
 
     Returns
     -------
@@ -106,7 +111,16 @@ def write_model(
     else:
         machine, sfunctions = "sm", []
     return write_drive_model(
-        path, BLOCK, values, variables, machine, w_M_ref, tau_L, t_stop, sfunctions
+        path,
+        BLOCK,
+        values,
+        variables,
+        machine,
+        w_M_ref,
+        tau_L,
+        t_stop,
+        sfunctions,
+        enable,
     )
 
 

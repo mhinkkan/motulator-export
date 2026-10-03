@@ -46,14 +46,22 @@ from tests.c_port import GCC, arr
 MOCK = Path(__file__).parent / "simulink_mock"
 
 
-def compile_sfunction(sfun: ControlBlock | SFunction, out_dir: Path) -> ctypes.CDLL:
-    """Generate the S-function (of a block) and compile it against the mock."""
+def compile_sfunction(
+    sfun: ControlBlock | SFunction, out_dir: Path, standalone: bool = False
+) -> ctypes.CDLL:
+    """
+    Generate the S-function (of a block) and compile it against the mock.
+
+    The standalone source is compiled without the files of the C port.
+
+    """
     if isinstance(sfun, ControlBlock):
         sfun = control_sfunction(sfun)
-    src = sfun.write(out_dir)
+    src = sfun.write(out_dir, standalone)
     lib = out_dir / "libsfun.so"
     cmd = [*GCC, "-Wall", "-Werror", "-Wno-unused-function", "-DMATLAB_MEX_FILE"]
-    cmd += [f"-I{MOCK}", f"-I{C_SOURCES}", str(src), "-lm", "-o", str(lib)]
+    cmd += [f"-I{MOCK}", *([] if standalone else [f"-I{C_SOURCES}"])]
+    cmd += [str(src), "-lm", "-o", str(lib)]
     subprocess.run(cmd, check=True)
     dll = ctypes.CDLL(str(lib))
     dll.sfun_start.restype = ctypes.c_char_p
@@ -68,7 +76,9 @@ def fvc(tmp_path_factory: pytest.TempPathFactory) -> ctypes.CDLL:
 
 @pytest.fixture(scope="module")
 def cvc(tmp_path_factory: pytest.TempPathFactory) -> ctypes.CDLL:
-    return compile_sfunction(im.CVC_BLOCK, tmp_path_factory.mktemp("cvc"))
+    # Standalone source, as in the library of the control system
+    path = tmp_path_factory.mktemp("cvc")
+    return compile_sfunction(im.CVC_BLOCK, path, standalone=True)
 
 
 @pytest.fixture(scope="module")
@@ -204,13 +214,55 @@ def drive_sfun(
             x = wrap(mech.meas_position()) if sensor == "theta_M" else mech.meas_speed()
             i_s_abc = mdl.machine.meas_currents()
             u_dc = mdl.converter.meas_dc_voltage()
-            return [cast(Any, ctrl.ext_ref.w_M)(t), *i_s_abc, u_dc, x]
+            return [1.0, cast(Any, ctrl.ext_ref.w_M)(t), *i_s_abc, u_dc, x]
 
         return SFunctionControlSystem(
             dll, block, cast(Any, ctrl.vector_ctrl).cfg.T_s, inputs
         )
 
     return sfun
+
+
+def check_enable(dll: ctypes.CDLL, block: ControlBlock, inputs: list[float]) -> None:
+    """
+    Check the input `enable` and the lower limit of the measured DC-bus voltage.
+
+    The started S-function is run with the given constant inputs (without `enable`).
+    Disabling should give zero voltage and reset the state to its initial value. The
+    outputs should stay finite without the DC-bus voltage, e.g., if the control system
+    is enabled before the DC bus is charged, the measured voltage being limited to
+    U_DC_MIN = 1 V.
+
+    """
+    y = (ctypes.c_double * (3 + len(block.signals)))()
+
+    def run(enable: float, n: int, u_dc: float | None = None) -> np.ndarray:
+        u = list(inputs)
+        if u_dc is not None:
+            u[sum(block.input_widths[1 : block.inputs.index("u_dc")])] = u_dc
+        out = np.zeros((n, len(y)))
+        for k in range(n):
+            dll.sfun_step(arr([enable, *u]), y)
+            out[k] = y
+        return out
+
+    def disable() -> None:
+        out = run(0.0, 2)
+        assert np.all(out[:, :3] == 0.5)
+        assert np.all(out[:, 3:] == 0)
+
+    disable()
+    first = run(1.0, 400)
+    assert np.all(np.isfinite(first))
+    assert np.any(first[-1, 3:] != 0)
+    disable()
+    assert np.array_equal(run(1.0, 400), first)
+    disable()
+    limited = run(1.0, 2000, 1.0)
+    assert np.all(np.isfinite(limited))
+    for u_dc in (0.0, -5.0):
+        disable()
+        assert np.array_equal(run(1.0, 2000, u_dc), limited)
 
 
 # %%
@@ -235,7 +287,8 @@ def test_parameter_errors(fvc: ctypes.CDLL) -> None:
 
 @pytest.mark.parametrize("sensorless", [True, False])
 def test_flux_vector_control(fvc: ctypes.CDLL, sensorless: bool) -> None:
-    """The S-function of flux-vector control should agree with motulator."""
+    """The S-function of flux-vector control should agree with motulator, and the
+    input `enable` should reset it."""
 
     def build() -> tuple[model.Drive, VectorControlSystem]:
         par = model.SynchronousMachinePars(**SM_PAR)
@@ -263,7 +316,43 @@ def test_flux_vector_control(fvc: ctypes.CDLL, sensorless: bool) -> None:
     }
     sfun = drive_sfun(fvc, sm.FVC_BLOCK, "theta_M")
     compare(build, model.Simulation, sfun, signals, 0.3)
+    check_enable(fvc, sm.FVC_BLOCK, [100.0, 3.0, -1.0, -2.0, 540.0, 0.3])
     fvc.sfun_terminate()
+
+
+IM_PAR = {"n_p": 2, "R_s": 3.7, "R_R": 2.1, "L_sgm": 0.021, "L_M": 0.224}
+IM_SPEED = {"J": 0.015, "alpha_s": 2 * pi * 4}
+
+
+def build_im_drive(
+    sensorless: bool = True, t_d: float = 0.0
+) -> tuple[model.Drive, VectorControlSystem]:
+    """Induction machine drive with current-vector control."""
+    par = model.InductionMachineInvGammaPars(**IM_PAR)
+    mdl = model.Drive(
+        model.InductionMachine(par),
+        model.MechanicalSystem(J=0.015),
+        model.VoltageSourceConverter(u_dc=540, t_d=t_d),
+    )
+    mdl.mechanics.set_external_load_torque(lambda t: (t > 0.2) * 14.6)
+    cfg = im_control.CurrentVectorControllerCfg(
+        psi_s_nom=1.04, i_s_max=10.6, sensorless=sensorless
+    )
+    d_err = None if t_d == 0 else lambda i, d: dead_time_error(i, d, t_d, cfg.T_s)
+    ctrl = VectorControlSystem(
+        im_control.CurrentVectorController(par, cfg),
+        im_control.SpeedController(**IM_SPEED),
+        im_control.PWM(d_err=d_err),
+    )
+    ctrl.set_speed_ref(lambda t: (t > 0.05) * 2 * pi * 20)
+    return mdl, ctrl
+
+
+IM_SIGNALS = {
+    "w_M": lambda fbk, _: fbk.w_M,
+    "tau_M_ref": lambda _, ref: ref.tau_M,
+    "psi_R": lambda fbk, _: np.abs(fbk.psi_R),
+}
 
 
 @pytest.mark.parametrize(
@@ -274,39 +363,15 @@ def test_flux_vector_control(fvc: ctypes.CDLL, sensorless: bool) -> None:
 def test_current_vector_control(cvc: ctypes.CDLL, sensorless: bool, t_d: float) -> None:
     """The S-function of current-vector control should agree with motulator, also
     with the dead time of the converter and its compensation."""
-    par = model.InductionMachineInvGammaPars(
-        n_p=2, R_s=3.7, R_R=2.1, L_sgm=0.021, L_M=0.224
-    )
-    speed = {"J": 0.015, "alpha_s": 2 * pi * 4}
 
     def build() -> tuple[model.Drive, VectorControlSystem]:
-        mdl = model.Drive(
-            model.InductionMachine(par),
-            model.MechanicalSystem(J=0.015),
-            model.VoltageSourceConverter(u_dc=540, t_d=t_d),
-        )
-        mdl.mechanics.set_external_load_torque(lambda t: (t > 0.2) * 14.6)
-        cfg = im_control.CurrentVectorControllerCfg(
-            psi_s_nom=1.04, i_s_max=10.6, sensorless=sensorless
-        )
-        d_err = None if t_d == 0 else lambda i, d: dead_time_error(i, d, t_d, cfg.T_s)
-        ctrl = VectorControlSystem(
-            im_control.CurrentVectorController(par, cfg),
-            im_control.SpeedController(**speed),
-            im_control.PWM(d_err=d_err),
-        )
-        ctrl.set_speed_ref(lambda t: (t > 0.05) * 2 * pi * 20)
-        return mdl, ctrl
+        return build_im_drive(sensorless, t_d)
 
-    values = im.export_mask_values(build()[1], speed)
+    values = im.export_mask_values(build()[1], IM_SPEED)
     assert start(cvc, sfunction_params(im.CVC_BLOCK, values)) is None
-    signals = {
-        "w_M": lambda fbk, _: fbk.w_M,
-        "tau_M_ref": lambda _, ref: ref.tau_M,
-        "psi_R": lambda fbk, _: np.abs(fbk.psi_R),
-    }
     sfun = drive_sfun(cvc, im.CVC_BLOCK, "w_M")
-    compare(build, model.Simulation, sfun, signals, 0.3)
+    compare(build, model.Simulation, sfun, IM_SIGNALS, 0.3)
+    check_enable(cvc, im.CVC_BLOCK, [100.0, 3.0, -1.0, -2.0, 540.0, 0.0])
     cvc.sfun_terminate()
 
 
@@ -328,8 +393,8 @@ def grid_sfun(
             u_dc = mdl.converter.meas_dc_voltage()
             if block is grid.GFL_BLOCK:
                 u_g_line = mdl.ac_filter.meas_pcc_voltages()
-                return [ext_ref.p_g(t), ext_ref.q_g(t), *i_c_abc, *u_g_line, u_dc]
-            return [ext_ref.p_g(t), ext_ref.v_c, *i_c_abc, u_dc]
+                return [1.0, ext_ref.p_g(t), ext_ref.q_g(t), *i_c_abc, *u_g_line, u_dc]
+            return [1.0, ext_ref.p_g(t), ext_ref.v_c, *i_c_abc, u_dc]
 
         T_s = grid._control_block(ctrl)[1]["T_s"]
         return SFunctionControlSystem(dll, block, T_s, inputs)
@@ -369,6 +434,9 @@ def test_grid_following_control(gfl: ctypes.CDLL) -> None:
     }
     sfun = grid_sfun(gfl, grid.GFL_BLOCK)
     compare(build, grid_model.Simulation, sfun, signals, 0.06)
+    # Line-to-line PCC voltages u_ab and u_bc of the voltage vector BASE.u
+    inputs = [5e3, 1e3, 3.0, -1.0, -2.0, 1.5 * BASE.u, 0.0, 650.0]
+    check_enable(gfl, grid.GFL_BLOCK, inputs)
     gfl.sfun_terminate()
 
 
@@ -411,6 +479,7 @@ def test_grid_forming_control(gfm: ctypes.CDLL, power_limitation: bool) -> None:
     }
     sfun = grid_sfun(gfm, grid.GFM_BLOCK)
     compare(build, grid_model.Simulation, sfun, signals, 0.25)
+    check_enable(gfm, grid.GFM_BLOCK, [5e3, BASE.u, 3.0, -1.0, -2.0, 650.0])
     gfm.sfun_terminate()
 
 
@@ -464,7 +533,7 @@ def test_gradnet_flux_vector_control(fvc: ctypes.CDLL) -> None:
         ref = cast(Any, ctrl.compute_output(fbk))
         ctrl.update(ref, fbk)
         res_py[k] = [*ref.d_abc, fbk.w_M, ref.tau_M, ref.psi_s, abs(fbk.psi_s)]
-        fvc.sfun_step(arr([ref.w_M, *complex2abc(i_s_ab[k]), 540.0, th]), y)
+        fvc.sfun_step(arr([1.0, ref.w_M, *complex2abc(i_s_ab[k]), 540.0, th]), y)
         out = dict(zip(names, y, strict=True))
         res_sl[k] = [out[name] for name in compared]
     fvc.sfun_terminate()

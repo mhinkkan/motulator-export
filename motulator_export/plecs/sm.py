@@ -58,7 +58,10 @@ from motulator_export.plecs._common import (
     C_DIR,
     C_GRADNET_PARAMS,
     C_PARAMS,
+    C_U_DC_MIN,
     DUTY_RATIO_CODE,
+    ENABLE,
+    ENABLE_DESCRIPTION,
     GRADNET_MAX_EMBED_DIM,
     GRADNET_MAX_IN_DIM,
     MACH,
@@ -73,6 +76,7 @@ from motulator_export.plecs._common import (
     _add_pwm,
     _write_model,
     cfg_assignments,
+    enable_code,
     monitored_code,
     parameter_checks,
 )
@@ -112,7 +116,7 @@ CTRL_OUTPUTS = {
 }
 
 # Inputs of the control system
-CTRL_INPUTS = ["w_M_ref", "i_s_abc", "u_dc", "theta_M"]
+CTRL_INPUTS = [ENABLE, "w_M_ref", "i_s_abc", "u_dc", "theta_M"]
 
 # GradNet parameters, as fields of a workspace struct and in the C-Script parameters
 GRADNET_FIELDS = [
@@ -411,7 +415,7 @@ def _control_cscript_code() -> dict[str, str]:
         f'#include "{C_DIR}/sm_parameters.c"\n'
         f'#include "{C_DIR}/sm_control_loci.c"\n'
         f'#include "{C_DIR}/sm_flux_vector.c"\n'
-        "\n" + C_PARAMS + "\n" + C_GRADNET_PARAMS + "\n"
+        "\n" + C_PARAMS + "\n" + C_U_DC_MIN + "\n" + C_GRADNET_PARAMS + "\n"
         "static VectorControlSystem ctrl;\n"
     )
     i = {m.variable: k for k, m in enumerate(MASK_PARAMS)}
@@ -472,22 +476,23 @@ def _control_cscript_code() -> dict[str, str]:
     }
     output = (
         "/* Measurements */\n"
-        "double w_M_ref = InputSignal(0, 0);\n"
-        "double i_s_abc[3] = {InputSignal(1, 0), InputSignal(1, 1),\n"
-        "                     InputSignal(1, 2)};\n"
-        "Measurements meas = {abc2complex(i_s_abc), InputSignal(2, 0),\n"
-        "                     InputSignal(3, 0)};\n"
+        "double w_M_ref = InputSignal(1, 0);\n"
+        "double i_s_abc[3] = {InputSignal(2, 0), InputSignal(2, 1),\n"
+        "                     InputSignal(2, 2)};\n"
+        "double u_dc = fmax(InputSignal(3, 0), U_DC_MIN);\n"
+        "Measurements meas = {abc2complex(i_s_abc), u_dc, InputSignal(4, 0)};\n"
         "\n"
         "vector_control_system_compute_output(&ctrl, &meas, w_M_ref);\n"
         "\n" + DUTY_RATIO_CODE + monitored_code(CTRL_OUTPUTS, monitored)
     )
     update = "vector_control_system_update(&ctrl);\n"
-    return {
+    code = {
         "Declarations": declarations,
         "StartFcn": start,
         "OutputFcn": output,
         "UpdateFcn": update,
     }
+    return enable_code(code, CTRL_OUTPUTS)
 
 
 def _machine_cscript_code() -> dict[str, str]:
@@ -706,11 +711,11 @@ FVC_BLOCK = ControlBlock(
         "parameters correspond to the motulator API: SynchronousMachinePars (or "
         "SaturatedSynchronousMachinePars with a GradNet flux map), "
         "FluxVectorControllerCfg, and SpeedController. Empty parameters ([]) "
-        "correspond to None, i.e., the defaults of motulator."
+        "correspond to None, i.e., the defaults of motulator." + ENABLE_DESCRIPTION
     ),
     mask_params=MASK_PARAMS,
     inputs=CTRL_INPUTS,
-    input_widths=[1, 3, 1, 1],
+    input_widths=[1, 1, 3, 1, 1],
     outputs=CTRL_OUTPUTS,
     code=_control_cscript_code,
     mask_init=MASK_INIT,
@@ -733,6 +738,7 @@ def write_model(
     t_stop: float,
     speed_ctrl_args: dict[str, float],
     outputs: bool = False,
+    enable: StepSignal | float = 1.0,
 ) -> Path:
     """
     Write a PLECS model of the drive system.
@@ -757,6 +763,10 @@ def write_model(
         "alpha_s": 25}``.
     outputs : bool, optional
         Add the output ports "mdl" and "ctrl" for `simulate`, defaults to False.
+    enable : StepSignal | float, optional
+        Input `enable` of the control system, defaults to 1 (enabled). While it is
+        not positive, the duty ratios are 0.5 and the state of the control system is
+        reset to its initial value.
 
     Returns
     -------
@@ -774,6 +784,7 @@ def write_model(
     sch = _Schematic()
     gradnet_plant = _has_gradnet_plant(mdl)
     sources: list[tuple[str, StepSignal | float | str]] = [
+        (ENABLE, enable),
         ("w_M_ref", w_M_ref),
         ("i_s_abc", _probe("Machine", MACHINE_PROBES[:1])),
         ("u_dc meas.", _probe("u_dc", ["Measured voltage"])),

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from motulator_export.plecs import sm
-from motulator_export.plecs._common import C_DIR, ControlBlock
+from motulator_export.plecs._common import C_DIR, C_SOURCES, ControlBlock
 
 # C-Script macros in terms of the Simulink API (the SimStruct is S in the callbacks)
 MACROS = """\
@@ -43,9 +43,18 @@ class SFunction:
     num_cont_states: int = 0
     feedthrough: list[int] = field(default_factory=list)  # Defaults to all inputs
 
-    def source(self) -> str:
-        """C source of the S-function."""
+    def source(self, standalone: bool = False) -> str:
+        """
+        C source of the S-function.
+
+        The standalone source contains the included files of the C port, so that it
+        can be compiled without them, e.g., for a real-time target.
+
+        """
         code = {k: v.replace(f"{C_DIR}/", "") for k, v in self.code.items()}
+        if standalone:
+            code["Declarations"] = _inline_includes(code["Declarations"], set())
+        include = "" if standalone else "-I<motulator_export/c> "
         feedthrough = self.feedthrough or [1] * len(self.input_widths)
         n_params = len(self.params)
         if self.sample_time is None:
@@ -93,7 +102,7 @@ class SFunction:
             " * variables, so a model can contain one instance of the block.\n"
             " *\n"
             " * Build with a C99 compiler with complex.h (gcc, clang, or MinGW-w64):\n"
-            f" *     mex -I<motulator_export/c> {self.name}.c\n"
+            f" *     mex {include}{self.name}.c\n"
             " */\n"
             "\n"
             f"#define S_FUNCTION_NAME {self.name}\n"
@@ -156,11 +165,24 @@ class SFunction:
             "#endif\n"
         )
 
-    def write(self, folder: str | Path) -> Path:
-        """Write the source of the S-function in the folder."""
+    def write(self, folder: str | Path, standalone: bool = False) -> Path:
+        """Write the source of the S-function in the folder, see `source`."""
         path = Path(folder) / f"{self.name}.c"
-        path.write_text(self.source())
+        path.write_text(self.source(standalone))
         return path
+
+
+def _inline_includes(text: str, included: set[str]) -> str:
+    """Replace the includes of the files of the C port with their contents, once."""
+
+    def contents(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name in included:
+            return ""
+        included.add(name)
+        return _inline_includes((C_SOURCES / name).read_text(), included)
+
+    return re.sub(r'^#include "(\w+\.[ch])"\n', contents, text, flags=re.M)
 
 
 def _callback(define: str | None, signature: str, body: str) -> str:
@@ -183,19 +205,20 @@ def sfunction_name(name: str) -> str:
     return "sfun_" + re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
 
 
-def control_sfunction(block: ControlBlock) -> SFunction:
+def control_sfunction(block: ControlBlock, name: str | None = None) -> SFunction:
     """
     S-function of a control-system block.
 
     The inputs are those of the block, and the outputs are the duty ratios and the
     groups of the monitored signals. The parameters are the C-Script parameters,
-    converted to double, and the sample time is the parameter `T_s`.
+    converted to double, and the sample time is the parameter `T_s`. The S-function
+    is named after the block, unless the name is given.
 
     """
     params = block.cscript_params or [m.variable for m in block.mask_params]
     variables = [m.variable for m in block.mask_params]
     return SFunction(
-        name=sfunction_name(block.name),
+        name=sfunction_name(name or block.name),
         code=block.code(),
         input_widths=block.input_widths,
         output_widths=[3, *(len(v) for v in block.outputs.values())],
